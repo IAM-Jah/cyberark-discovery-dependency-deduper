@@ -137,7 +137,7 @@ function Write-Log { param([string]$Message,[string]$Level="INFO")
         return @{ 'Authorization' = "Bearer $tokenString"; 'X-Authorization' = $tokenString }
       }
     } catch {
-      Write-Log "Auth attempt failed on $u: $($_.Exception.Message)" "WARN"
+      Write-Log "Auth attempt failed on ${u}: $($_.Exception.Message)" "WARN"
     }
   }
   throw "All logon endpoints failed. Check -PVWAUrl/-AuthType or provide -BearerToken."
@@ -412,7 +412,7 @@ function Update-Dependency {
     Write-Log "Merged props into keeper via PUT Dependencies: acct=$AccountId dep=$DepId keys=[$(($payload.Keys -join ','))]"
     return $true
   } catch {
-    Write-Log "PUT /Dependencies failed for acct=$AccountId dep=$DepId: $($_.Exception.Message)" "WARN"
+    Write-Log "PUT /Dependencies failed for acct=$AccountId dep=${DepId}: $($_.Exception.Message)" "WARN"
     try {
       $null = Invoke-PVWARest -Method PATCH -Uri $u1 -Headers $Headers -Body $payload
       Write-Log "Merged props into keeper via PATCH Dependencies: acct=$AccountId dep=$DepId"
@@ -454,13 +454,13 @@ function Update-Dependency {
     Write-Log "Deleted alias via Dependencies endpoint: acct=$AccountId dep=$DepId"
     return $true
   } catch {
-    Write-Log "DELETE /Dependencies failed for acct=$AccountId dep=$DepId: $($_.Exception.Message)" "WARN"
+    Write-Log "DELETE /Dependencies failed for acct=$AccountId dep=${DepId}: $($_.Exception.Message)" "WARN"
     try {
       $null = Invoke-PVWARest -Method DELETE -Uri $u2 -Headers $Headers
       Write-Log "Deleted alias via Usages endpoint: acct=$AccountId dep=$DepId"
       return $true
     } catch {
-      Write-Log "DELETE /Usages failed for acct=$AccountId dep=$DepId: $($_.Exception.Message)" "ERROR"
+      Write-Log "DELETE /Usages failed for acct=$AccountId dep=${DepId}: $($_.Exception.Message)" "ERROR"
       return $false
     }
   }
@@ -501,7 +501,7 @@ foreach ($acctId in $Touched) {
       $r = Invoke-PVWARest -Method GET -Uri $depUri2 -Headers $Headers
       $deps = As-Array ($r.value ?? $r.Usages ?? $r)
     } catch {
-      Write-Log "Post-verify failed for acct=$acctId: $($_.Exception.Message)" "ERROR"
+      Write-Log "Post-verify failed for acct=${acctId}: $($_.Exception.Message)" "ERROR"
       continue
     }
   }
