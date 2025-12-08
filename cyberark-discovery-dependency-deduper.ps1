@@ -83,6 +83,46 @@ function Write-Log { param([string]$Message,[string]$Level="INFO")
   if ($o -is [System.Collections.IEnumerable] -and $o -isnot [string]) { return @($o) }
   return ,$o
 }
+function Get-Prop {
+  param(
+    [Parameter(Mandatory)][object]$Object,
+    [Parameter(Mandatory)][string[]]$Names
+  )
+  if ($null -eq $Object) { return $null }
+
+  $psobj = [psobject]$Object
+
+  # 1st pass – direct properties on the object
+  foreach ($name in $Names) {
+    $prop = $psobj.PSObject.Properties[$name]
+    if ($null -ne $prop -and $null -ne $prop.Value) {
+      return $prop.Value
+    }
+  }
+
+  # 2nd pass – platformAccountProperties (for dependentAccounts APIs)
+  $platProp = $psobj.PSObject.Properties['platformAccountProperties']
+  if ($platProp -and $platProp.Value) {
+    $plat = $platProp.Value
+
+    if ($plat -is [hashtable]) {
+      foreach ($name in $Names) {
+        if ($plat.ContainsKey($name) -and $null -ne $plat[$name]) {
+          return $plat[$name]
+        }
+      }
+    } else {
+      $platPs = [psobject]$plat
+      foreach ($name in $Names) {
+        $inner = $platPs.PSObject.Properties[$name]
+        if ($null -ne $inner -and $null -ne $inner.Value) {
+          return $inner.Value
+        }
+      }
+    }
+  }
+  return $null
+}
 	function Invoke-PVWARest {
   param(
     [Parameter(Mandatory)][ValidateSet('GET','POST','PUT','PATCH','DELETE')] [string]$Method,
@@ -131,9 +171,12 @@ function Write-Log { param([string]$Message,[string]$Level="INFO")
     try {
       $tok = Invoke-RestMethod -Method POST -Uri $u -ContentType 'application/json' -Body ($body | ConvertTo-Json) -TimeoutSec $TimeoutSec
       if ($tok) {
-        $tokenString = if ($tok -is [string]) { $tok } elseif ($tok.token) { $tok.token } else { [string]$tok }
-        Write-Log "Authenticated via $u"
-        # Send both, some versions prefer X-Authorization
+        if ($tok -is [string]) {
+          $tokenString = $tok
+        } else {
+          $tokenProp = $tok.PSObject.Properties['token']
+          $tokenString = if ($tokenProp) { [string]$tokenProp.Value } else { [string]$tok }
+        }
         return @{ 'Authorization' = "Bearer $tokenString"; 'X-Authorization' = $tokenString }
       }
     } catch {
@@ -170,22 +213,26 @@ $null = $AliasMap.Keys | ForEach-Object { [void]$AliasSet.Add($_) }
 	function Lower([string]$s){ if ($null -eq $s) { return $null } return $s.ToLower() }
 	# Extracts type-specific identifiers to build a stable join key
 function Get-CanonicalIdentifiers {
-  param([hashtable]$Dep)
+  param([object]$Dep)
+
   # Keys vary by dependency type & PVWA version. We try common patterns.
-  $type = $Dep.Type ?? $Dep.UsageType ?? $Dep.DependencyType
-  $machine = $Dep.MachineName ?? $Dep.ComputerName ?? $Dep.Target ?? $Dep.Address ?? $Dep.HostName
-  $service = $Dep.ServiceName
-  $taskPath = $Dep.TaskPath ?? $Dep.TaskName
-  $iisApp = $Dep.Application ?? $Dep.AppName
-  $iisPool = $Dep.AppPool ?? $Dep.ApplicationPool
-  $site = $Dep.Site ?? $Dep.SiteName
-  $exe = $Dep.BinaryPathName ?? $Dep.ExecutablePath
+  $type    = Get-Prop $Dep @('Type','UsageType','DependencyType','platformId')
+  $machine = Get-Prop $Dep @('MachineName','ComputerName','Target','Address','ComputerDnsName','HostName')
+  $service = Get-Prop $Dep @('ServiceName')
+  $task    = Get-Prop $Dep @('TaskPath','TaskName')
+  $iisApp  = Get-Prop $Dep @('Application','AppName')
+  $iisPool = Get-Prop $Dep @('AppPool','ApplicationPool')
+  $site    = Get-Prop $Dep @('Site','SiteName')
+  $exe     = Get-Prop $Dep @('BinaryPathName','ExecutablePath')
+  $name    = Get-Prop $Dep @('Name','DisplayName','Id','ID','DependencyID','UsageID','dependentAccountId')
+
   $obj =
-    if ($service) { $service }
-    elseif ($taskPath) { $taskPath }
-    elseif ($iisApp -or $iisPool -or $site) { "$($iisPool)|$($site)|$($iisApp)" }
-    elseif ($exe) { $exe }
-    else { $Dep.Name ?? $Dep.DisplayName ?? $Dep.Id }
+    if     ($service)                     { $service }
+    elseif ($task)                        { $task }
+    elseif ($iisApp -or $iisPool -or $site) { "$iisPool|$site|$iisApp" }
+    elseif ($exe)                         { $exe }
+    else                                  { $name }
+
   [pscustomobject]@{
     Type    = "$type"
     Machine = "$machine"
@@ -195,7 +242,7 @@ function Get-CanonicalIdentifiers {
 	# Build dedupe key (domain intentionally omitted; user normalized)
 function Build-JoinKey {
   param(
-    [hashtable]$Dep,
+    [object]$Dep,
     [string]$NormalizedUser
   )
   $ci = Get-CanonicalIdentifiers -Dep $Dep
@@ -255,18 +302,26 @@ do {
   elseif ($resp -is [System.Collections.IEnumerable]) { $batch = As-Array $resp }
   else { $batch = @() }
 
-	foreach ($a in $batch) {
-    # normalize common fields
-    $acc = [pscustomobject]@{
-      Id         = $a.Id ?? $a.id ?? $a.AccountID
-      Name       = $a.Name ?? $a.UserName ?? $a.address
-      SafeName   = $a.SafeName ?? $a.safeName
-      PlatformId = $a.PlatformId ?? $a.platformId
-      Address    = $a.address
-      UserName   = $a.userName ?? $a.UserName
-    }
-    $Accounts += $acc
+  foreach ($a in $batch) {
+    # normalize common fields (case-insensitive, StrictMode-safe)
+    $acctId       = Get-Prop $a @('id','Id','AccountID')
+    $acctName     = Get-Prop $a @('Name','name','UserName','userName')
+    $acctSafe     = Get-Prop $a @('SafeName','safeName')
+    $acctPlatform = Get-Prop $a @('PlatformId','platformId')
+    $acctAddress  = Get-Prop $a @('address','Address')
+    $acctUser     = Get-Prop $a @('UserName','userName')
+
+  $acc = [pscustomobject]@{
+    Id         = $acctId
+    Name       = $acctName ?? $acctAddress
+    SafeName   = $acctSafe
+    PlatformId = $acctPlatform
+    Address    = $acctAddress
+    UserName   = $acctUser
   }
+  $Accounts += $acc
+}
+
 	$count = $batch.Count
   $offset += $PageSize
   Write-Log "Fetched $count accounts (offset=$offset)" "DEBUG"
@@ -286,42 +341,63 @@ if ($AccountNameFilter) {
   }
 }
 	Write-Log "Accounts in scope: $($Accounts.Count)"
+  #TODO REMOVE AFTER TESTING
+  if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir | Out-Null }
+    $resp | ConvertTo-Json -Depth 5 | Out-File "$OutDir\accounts-raw.json"
+    ($resp.value ?? $resp.Accounts ?? $resp) |
+    Select-Object -First 1 |
+    ConvertTo-Json -Depth 5 |
+    Out-File "$OutDir\accounts-first.json"
+  #TODO REMOVE AFTER TESTING
 	# Pull dependencies/usages for each account
 $AllDeps = @()
 foreach ($acct in $Accounts) {
   if (-not $acct.Id) { continue }
+  $depUri0 = "$PVWAUrl/PasswordVault/API/Accounts/$($acct.Id)/dependentAccounts"
   $depUri1 = "$PVWAUrl/PasswordVault/API/Accounts/$($acct.Id)/Dependencies"
   $depUri2 = "$PVWAUrl/PasswordVault/API/Accounts/$($acct.Id)/Usages"
   $deps = @()
+
   try {
-    $r = Invoke-PVWARest -Method GET -Uri $depUri1 -Headers $Headers
-    $deps = As-Array ($r.value ?? $r.Dependencies ?? $r)
+    # Preferred modern endpoint (Self-Hosted 12+/Privilege Cloud)
+    $r = Invoke-PVWARest -Method GET -Uri $depUri0 -Headers $Headers
+    $deps = As-Array ($r.value ?? $r)
   } catch {
-    Write-Log "Dependencies endpoint failed for $($acct.Id). Trying /Usages..." "WARN"
+    Write-Log "dependentAccounts endpoint failed for $($acct.Id). Trying legacy /Dependencies..." "WARN"
     try {
-      $r = Invoke-PVWARest -Method GET -Uri $depUri2 -Headers $Headers
-      $deps = As-Array ($r.value ?? $r.Usages ?? $r)
+      $r = Invoke-PVWARest -Method GET -Uri $depUri1 -Headers $Headers
+      $deps = As-Array ($r.value ?? $r.Dependencies ?? $r)
     } catch {
-      Write-Log "Usages endpoint also failed for $($acct.Id): $($_.Exception.Message)" "ERROR"
-      continue
+      Write-Log "Dependencies endpoint failed for $($acct.Id). Trying /Usages..." "WARN"
+      try {
+        $r = Invoke-PVWARest -Method GET -Uri $depUri2 -Headers $Headers
+        $deps = As-Array ($r.value ?? $r.Usages ?? $r)
+      } catch {
+        Write-Log "All dependency endpoints failed for $($acct.Id): $($_.Exception.Message)" "ERROR"
+        continue
+      }
     }
   }
 	# Save raw snapshot
   $rawPath = Join-Path $OutDir "raw\acct_$($acct.Id).json"
   ($deps | ConvertTo-Json -Depth 50) | Out-File -Encoding UTF8 $rawPath
-	foreach ($d in $deps) {
+  foreach ($d in $deps) {
+    # capture raw as hashtable for diffing/snapshots
     $h = @{}
-    foreach ($p in ($d.PSObject.Properties.Name)) { $h[$p] = $d.$p }
-    # derive logon domain/username if present
-    $domain = $h.LogonDomain ?? $h.Domain ?? $h.AccountDomain
-    $user   = $h.LogonUser ?? $h.User ?? $h.UserName ?? $h.AccountName
-    $canon  = Get-CanonicalIdentifiers -Dep $h
+    foreach ($p in $d.PSObject.Properties.Name) { $h[$p] = $d.$p }
+
+    # derive logon domain/username from original PSObject
+    $domain = Get-Prop $d @('LogonDomain','Domain','AccountDomain')
+    $user   = Get-Prop $d @('LogonUser','User','UserName','AccountName')
+
+    $canon  = Get-CanonicalIdentifiers -Dep $d
+
     $AllDeps += [pscustomobject]@{
       AccountId         = $acct.Id
       SafeName          = $acct.SafeName
       AccountName       = $acct.Name
       PlatformId        = $acct.PlatformId
-      DependencyId      = $h.Id ?? $h.ID ?? $h.DependencyID ?? $h.UsageID
+      DependencyId      = $h['Id'] ?? $h['ID'] ?? $h['DependencyID'] ?? $h['UsageID']
       Raw               = $h
       Type              = $canon.Type
       Machine           = $canon.Machine
@@ -330,7 +406,7 @@ foreach ($acct in $Accounts) {
       DomainMapped      = Map-Domain $domain
       UserOriginal      = $user
       UserNormalized    = Normalize-User $user
-      JoinKey           = Build-JoinKey -Dep $h -NormalizedUser (Normalize-User $user)
+      JoinKey           = Build-JoinKey -Dep $d -NormalizedUser (Normalize-User $user)
     }
   }
 }
@@ -405,9 +481,22 @@ function Update-Dependency {
   if ($NewProps.Keys.Count -eq 0) { return $true }
   $payload = @{}
   foreach ($k in $NewProps.Keys) { $payload[$k] = $NewProps[$k] }
-	$u1 = "$PVWAUrl/PasswordVault/API/Accounts/$AccountId/Dependencies/$DepId"
+
+  $u0 = "$PVWAUrl/PasswordVault/API/Accounts/$AccountId/dependentAccounts/$DepId"
+  $u1 = "$PVWAUrl/PasswordVault/API/Accounts/$AccountId/Dependencies/$DepId"
   $u2 = "$PVWAUrl/PasswordVault/API/Accounts/$AccountId/Usages/$DepId"
-	try {
+
+  # Preferred: dependentAccounts API
+  try {
+    $null = Invoke-PVWARest -Method PUT -Uri $u0 -Headers $Headers -Body $payload
+    Write-Log "Merged props into keeper via PUT dependentAccounts: acct=$AccountId dep=$DepId keys=[$(($payload.Keys -join ','))]"
+    return $true
+  } catch {
+    Write-Log "PUT /dependentAccounts failed for acct=$AccountId dep=${DepId}: $($_.Exception.Message)" "WARN"
+  }
+
+  # Legacy fallbacks: /Dependencies then /Usages
+  try {
     $null = Invoke-PVWARest -Method PUT -Uri $u1 -Headers $Headers -Body $payload
     Write-Log "Merged props into keeper via PUT Dependencies: acct=$AccountId dep=$DepId keys=[$(($payload.Keys -join ','))]"
     return $true
@@ -447,9 +536,21 @@ function Update-Dependency {
   $stamp = Get-Date -Format "yyyyMMdd_HHmmssfff"
   $arch = Join-Path $OutDir ("archive\alias_acct{0}_dep{1}_{2}.json" -f $AccountId,$DepId,$stamp)
   ($AliasRaw | ConvertTo-Json -Depth 50) | Out-File -Encoding UTF8 $arch
-	$u1 = "$PVWAUrl/PasswordVault/API/Accounts/$AccountId/Dependencies/$DepId"
+  $u0 = "$PVWAUrl/PasswordVault/API/Accounts/$AccountId/dependentAccounts/$DepId"
+  $u1 = "$PVWAUrl/PasswordVault/API/Accounts/$AccountId/Dependencies/$DepId"
   $u2 = "$PVWAUrl/PasswordVault/API/Accounts/$AccountId/Usages/$DepId"
-	try {
+
+  # Preferred: dependentAccounts
+  try {
+    $null = Invoke-PVWARest -Method DELETE -Uri $u0 -Headers $Headers
+    Write-Log "Deleted alias via dependentAccounts endpoint: acct=$AccountId dep=$DepId"
+    return $true
+  } catch {
+    Write-Log "DELETE /dependentAccounts failed for acct=$AccountId dep=${DepId}: $($_.Exception.Message)" "WARN"
+  }
+
+  # Legacy fallbacks
+  try {
     $null = Invoke-PVWARest -Method DELETE -Uri $u1 -Headers $Headers
     Write-Log "Deleted alias via Dependencies endpoint: acct=$AccountId dep=$DepId"
     return $true
@@ -490,33 +591,45 @@ $deleted = 0
 $Touched = $Candidates | Select-Object -Expand AccountId -Unique
 $Post = @()
 foreach ($acctId in $Touched) {
+  $depUri0 = "$PVWAUrl/PasswordVault/API/Accounts/$acctId/dependentAccounts"
   $depUri1 = "$PVWAUrl/PasswordVault/API/Accounts/$acctId/Dependencies"
   $depUri2 = "$PVWAUrl/PasswordVault/API/Accounts/$acctId/Usages"
   $deps = @()
   try {
-    $r = Invoke-PVWARest -Method GET -Uri $depUri1 -Headers $Headers
-    $deps = As-Array ($r.value ?? $r.Dependencies ?? $r)
+    $r = Invoke-PVWARest -Method GET -Uri $depUri0 -Headers $Headers
+    $deps = As-Array ($r.value ?? $r)
   } catch {
     try {
-      $r = Invoke-PVWARest -Method GET -Uri $depUri2 -Headers $Headers
-      $deps = As-Array ($r.value ?? $r.Usages ?? $r)
+      $r = Invoke-PVWARest -Method GET -Uri $depUri1 -Headers $Headers
+      $deps = As-Array ($r.value ?? $r.Dependencies ?? $r)
     } catch {
-      Write-Log "Post-verify failed for acct=${acctId}: $($_.Exception.Message)" "ERROR"
-      continue
+      try {
+        $r = Invoke-PVWARest -Method GET -Uri $depUri2 -Headers $Headers
+        $deps = As-Array ($r.value ?? $r.Usages ?? $r)
+      } catch {
+        Write-Log "Post-verify failed for acct=${acctId}: $($_.Exception.Message)" "ERROR"
+        continue
+      }
     }
   }
   foreach ($d in $deps) {
-    $h = @{}; foreach ($p in ($d.PSObject.Properties.Name)) { $h[$p] = $d.$p }
-    $user   = $h.LogonUser ?? $h.User ?? $h.UserName ?? $h.AccountName
+    # raw snapshot as hashtable (if you want to inspect later)
+    $h = @{}
+    foreach ($p in $d.PSObject.Properties.Name) { $h[$p] = $d.$p }
+
+    $domain = Get-Prop $d @('LogonDomain','Domain','AccountDomain')
+    $user   = Get-Prop $d @('LogonUser','User','UserName','AccountName')
+    $canon  = Get-CanonicalIdentifiers -Dep $d
+
     $Post += [pscustomobject]@{
       AccountId    = $acctId
-      DepId        = $h.Id ?? $h.ID ?? $h.DependencyID ?? $h.UsageID
-      Type         = "$($h.Type ?? $h.UsageType ?? $h.DependencyType)"
-      Machine      = "$($h.MachineName ?? $h.ComputerName ?? $h.Target ?? $h.Address ?? $h.HostName)"
-      ObjectName   = "$( ($h.ServiceName) ?? ($h.TaskPath ?? $h.TaskName) ?? ($h.Application ?? $h.AppName) ?? ($h.BinaryPathName ?? $h.ExecutablePath) ?? ($h.Name ?? $h.DisplayName) )"
-      Domain       = "$($h.LogonDomain ?? $h.Domain ?? $h.AccountDomain)"
+      DepId        = $h['Id'] ?? $h['ID'] ?? $h['DependencyID'] ?? $h['UsageID']
+      Type         = "$($canon.Type)"
+      Machine      = "$($canon.Machine)"
+      ObjectName   = "$($canon.Object)"
+      Domain       = "$domain"
       User         = "$user"
-      JoinKey      = Build-JoinKey -Dep $h -NormalizedUser (Normalize-User $user)
+      JoinKey      = Build-JoinKey -Dep $d -NormalizedUser (Normalize-User $user)
     }
   }
 }
