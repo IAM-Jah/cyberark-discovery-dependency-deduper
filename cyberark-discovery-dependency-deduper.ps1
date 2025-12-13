@@ -83,6 +83,34 @@ function Write-Log { param([string]$Message,[string]$Level="INFO")
   if ($o -is [System.Collections.IEnumerable] -and $o -isnot [string]) { return @($o) }
   return ,$o
 }
+function Get-ArrayFromResponse {
+  param([Parameter(Mandatory)][object]$Resp)
+
+  if ($null -eq $Resp) { return @() }
+
+  # If API returned a bare array (including empty []), return it directly
+  if ($Resp -is [System.Collections.IEnumerable] -and $Resp -isnot [string]) {
+    # If it's a PSCustomObject wrapper, PSObject.Properties will exist and we should inspect it below,
+    # so only early-return when it is truly an array-like response (object[])
+    if ($Resp -is [object[]]) { return @($Resp) }
+  }
+
+  $p = $Resp.PSObject.Properties
+
+  if ($p['value'])             { return As-Array $p['value'].Value }
+  if ($p['accountDependents']) { return As-Array $p['accountDependents'].Value }
+  if ($p['dependentAccounts']) { return As-Array $p['dependentAccounts'].Value }
+  if ($p['Dependencies'])      { return As-Array $p['Dependencies'].Value }
+  if ($p['Usages'])            { return As-Array $p['Usages'].Value }
+
+  # Fallback: sometimes the API returns a bare array (non-object[])
+  if ($Resp -is [System.Collections.IEnumerable] -and $Resp -isnot [string]) {
+    return As-Array $Resp
+  }
+
+  return @()
+}
+
 function Get-Prop {
   param(
     [Parameter(Mandatory)][object]$Object,
@@ -118,6 +146,22 @@ function Get-Prop {
         if ($null -ne $inner -and $null -ne $inner.Value) {
           return $inner.Value
         }
+      }
+    }
+  }
+  # 3rd pass – platformDependentProperties (for account-dependents endpoint)
+  $depProp = $psobj.PSObject.Properties['platformDependentProperties']
+  if ($depProp -and $depProp.Value) {
+    $plat = $depProp.Value
+    if ($plat -is [hashtable]) {
+      foreach ($name in $Names) {
+        if ($plat.ContainsKey($name) -and $null -ne $plat[$name]) { return $plat[$name] }
+      }
+    } else {
+      $platPs = [psobject]$plat
+      foreach ($name in $Names) {
+        $inner = $platPs.PSObject.Properties[$name]
+        if ($null -ne $inner -and $null -ne $inner.Value) { return $inner.Value }
       }
     }
   }
@@ -221,7 +265,7 @@ function Get-CanonicalIdentifiers {
   $service = Get-Prop $Dep @('ServiceName')
   $task    = Get-Prop $Dep @('TaskPath','TaskName')
   $iisApp  = Get-Prop $Dep @('Application','AppName')
-  $iisPool = Get-Prop $Dep @('AppPool','ApplicationPool')
+  $iisPool = Get-Prop $Dep @('AppPool','AppPoolName','ApplicationPool')
   $site    = Get-Prop $Dep @('Site','SiteName')
   $exe     = Get-Prop $Dep @('BinaryPathName','ExecutablePath')
   $name    = Get-Prop $Dep @('Name','DisplayName','Id','ID','DependencyID','UsageID','dependentAccountId')
@@ -322,9 +366,9 @@ do {
   $Accounts += $acc
 }
 
-	$count = $batch.Count
+	$count = @($batch).Count
   $offset += $PageSize
-  Write-Log "Fetched $count accounts (offset=$offset)" "DEBUG"
+  Write-Log "Fetched $count accounts" "DEBUG"
 } while ($count -eq $PageSize)
 	# Client-side filters
 if ($SafeFilter) {
@@ -341,54 +385,57 @@ if ($AccountNameFilter) {
   }
 }
 	Write-Log "Accounts in scope: $($Accounts.Count)"
-  #TODO REMOVE AFTER TESTING
-  if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir | Out-Null }
-    $resp | ConvertTo-Json -Depth 5 | Out-File "$OutDir\accounts-raw.json"
-    ($resp.value ?? $resp.Accounts ?? $resp) |
-    Select-Object -First 1 |
-    ConvertTo-Json -Depth 5 |
-    Out-File "$OutDir\accounts-first.json"
-  #TODO REMOVE AFTER TESTING
-	# Pull dependencies/usages for each account
+
+# Pull dependencies/usages for each account
 $AllDeps = @()
+
 foreach ($acct in $Accounts) {
   if (-not $acct.Id) { continue }
-  $depUri0 = "$PVWAUrl/PasswordVault/API/Accounts/$($acct.Id)/dependentAccounts"
-  $depUri1 = "$PVWAUrl/PasswordVault/API/Accounts/$($acct.Id)/Dependencies"
-  $depUri2 = "$PVWAUrl/PasswordVault/API/Accounts/$($acct.Id)/Usages"
-  $deps = @()
+
+  $baseUrl  = $PVWAUrl.TrimEnd('/')
+  $accountId = [uri]::EscapeDataString([string]$acct.Id)
+  $depUri   = "$baseUrl/api/accounts/$accountId/account-dependents"
 
   try {
-    # Preferred modern endpoint (Self-Hosted 12+/Privilege Cloud)
-    $r = Invoke-PVWARest -Method GET -Uri $depUri0 -Headers $Headers
-    $deps = As-Array ($r.value ?? $r)
-  } catch {
-    Write-Log "dependentAccounts endpoint failed for $($acct.Id). Trying legacy /Dependencies..." "WARN"
-    try {
-      $r = Invoke-PVWARest -Method GET -Uri $depUri1 -Headers $Headers
-      $deps = As-Array ($r.value ?? $r.Dependencies ?? $r)
-    } catch {
-      Write-Log "Dependencies endpoint failed for $($acct.Id). Trying /Usages..." "WARN"
-      try {
-        $r = Invoke-PVWARest -Method GET -Uri $depUri2 -Headers $Headers
-        $deps = As-Array ($r.value ?? $r.Usages ?? $r)
-      } catch {
-        Write-Log "All dependency endpoints failed for $($acct.Id): $($_.Exception.Message)" "ERROR"
-        continue
-      }
-    }
+    $r = Invoke-PVWARest -Method GET -Uri $depUri -Headers $Headers
+
+    # Always normalize to an array (never $null)
+    $deps = @( Get-ArrayFromResponse -Resp $r )   # forces array context
+    $depCount = $deps.Count                       # fail safe
+
+    # Write wrapper and extracted array AFTER extraction
+    $rawWrapperPath = Join-Path $OutDir "raw\acct_$($acct.Id)_wrapper.json"
+    ($r | ConvertTo-Json -Depth 50) | Out-File -Encoding UTF8 $rawWrapperPath
+
+    $rawArrayPath = Join-Path $OutDir "raw\acct_$($acct.Id)_deps.json"
+    ($deps | ConvertTo-Json -Depth 50) | Out-File -Encoding UTF8 $rawArrayPath
+
+    Write-Log ("Dependents response props for {0}: {1}" -f $acct.Id, ((@($r.PSObject.Properties.Name)) -join ',')) "DEBUG"
+    Write-Log ("Dependents extracted count for {0}: {1}" -f $acct.Id, $depCount) "DEBUG"
   }
-	# Save raw snapshot
+  catch {
+    Write-Log "account-dependents endpoint failed for $($acct.Id): $($_.Exception.Message)" "ERROR"
+
+    # still emit empty artifacts so “missing vs empty” is visible
+    $rawWrapperPath = Join-Path $OutDir "raw\acct_$($acct.Id)_wrapper.json"
+    (@{ error = $_.Exception.Message } | ConvertTo-Json -Depth 10) | Out-File -Encoding UTF8 $rawWrapperPath
+
+    $rawArrayPath = Join-Path $OutDir "raw\acct_$($acct.Id)_deps.json"
+    "[]" | Out-File -Encoding UTF8 $rawArrayPath
+
+    continue
+  }
+
+  # Save raw snapshot (keep your existing naming if you want)
   $rawPath = Join-Path $OutDir "raw\acct_$($acct.Id).json"
   ($deps | ConvertTo-Json -Depth 50) | Out-File -Encoding UTF8 $rawPath
+
   foreach ($d in $deps) {
-    # capture raw as hashtable for diffing/snapshots
     $h = @{}
     foreach ($p in $d.PSObject.Properties.Name) { $h[$p] = $d.$p }
 
-    # derive logon domain/username from original PSObject
     $domain = Get-Prop $d @('LogonDomain','Domain','AccountDomain')
-    $user   = Get-Prop $d @('LogonUser','User','UserName','AccountName')
+    $user   = Get-Prop $d @('LogonUser','LogonUserName','User','UserName','AccountName')  # expanded a bit
 
     $canon  = Get-CanonicalIdentifiers -Dep $d
 
@@ -410,21 +457,21 @@ foreach ($acct in $Accounts) {
     }
   }
 }
-	Write-Log "Dependencies/usages collected: $($AllDeps.Count)"
-	# Identify duplicates: same Account + JoinKey but different domain strings (alias vs authoritative)
+
+Write-Log "Dependencies/usages collected: $($AllDeps.Count)"
+
+# Identify duplicates: same Account + JoinKey but different domain strings (alias vs authoritative)
 $groups = $AllDeps | Group-Object -Property AccountId, JoinKey
 $Candidates = @()
 	foreach ($g in $groups) {
   $items = $g.Group
-  if ($items.Count -lt 2) { continue }
+  if (@($items).Count -lt 2) { continue }
 	# Partition by whether domain is alias
-  $alias = $items | Where-Object { $_.DomainOriginal -and $AliasSet.Contains($_.DomainOriginal) }
-  if ($alias.Count -eq 0) { continue }
-	$auth = $items | Where-Object { $_.DomainMapped -and ($_.DomainMapped -eq $_.DomainOriginal) } # original already authoritative
-  if ($auth.Count -eq 0) {
-    # No explicit authoritative entry; skip (or consider converting alias → authoritative)
-    continue
-  }
+  $alias = @($items | Where-Object { $_.DomainOriginal -and $AliasSet.Contains($_.DomainOriginal) })
+  if (@($alias).Count -eq 0) { continue }
+
+  $auth  = @($items | Where-Object { $_.DomainMapped -and ($_.DomainMapped -eq $_.DomainOriginal) })
+  if (@($auth).Count -eq 0) { continue }
 
 	# Choose the first authoritative as the keeper
   $keeper = $auth | Select-Object -First 1
@@ -459,7 +506,8 @@ $dry = $Candidates | Select-Object SafeName,AccountId,AccountName,PlatformId,Typ
 $dry | Export-Csv -NoTypeInformation -Encoding UTF8 $DryPath
 Write-Log "Dry-run written: $DryPath"
 Write-Output "Dry-run path: $DryPath"
-Write-Output ("Found {0} alias duplicates across {1} accounts" -f ($Candidates.Count), (($Candidates | Select-Object -Expand AccountId | Sort-Object -Unique).Count))
+$uniqueAccounts = @($Candidates | Select-Object -Expand AccountId | Sort-Object -Unique)
+Write-Output ("Found {0} alias duplicates across {1} accounts" -f (@($Candidates).Count), $uniqueAccounts.Count)
 	if (-not $Apply) {
   Write-Output "Analysis complete. Re-run with -Apply (and optionally -Force) to perform merges/deletes."
   return
