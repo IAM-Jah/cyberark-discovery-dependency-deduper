@@ -7,7 +7,7 @@
   plan and, if -Apply is used, merges useful settings into the authoritative entry
   and deletes the alias duplicate. All actions are logged with JSON snapshots.
 	.NOTES
-  - Tested against PVWA 12–14 style APIs; includes fallbacks for "Dependencies" vs "Usages".
+  - Supports only: ISPSS /api/accounts/{id}/account-dependents and Self-Hosted /PasswordVault/API/Accounts/{id}/dependentAccounts.
   - Start with a scoped run (e.g., -SafeFilter) and review dry run output first.
   - You can supply the alias to authoritative domain name mapping via -AliasMapPath (JSON) or -AliasMap.
 
@@ -23,8 +23,7 @@
   Path to JSON file with alias to authoritative domain mappings. Example:
   { "domain.edu": "subdomain.domain.edu", "NETBIOS": "subdomain.domain.edu" }
 	.PARAMETER AliasMap
-  Hashtable for alias→authoritative mappings (alternative to AliasMapPath).
-
+  Hashtable for alias to authoritative mappings (alternative to AliasMapPath).
 	.PARAMETER SafeFilter
   One or more Safe names to include. If omitted, all Safes are considered.
 	.PARAMETER PlatformIdFilter
@@ -57,7 +56,8 @@ param(
   [Parameter()][switch]$VerboseRest,
   [Parameter()][switch]$SkipCertValidation
 )
-	Set-StrictMode -Version Latest
+$script:DependentsApiFlavor = 'ISPSS'      # or 'SelfHosted'
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 	#region Helpers ----------------------------------------------------------------
 	if ($SkipCertValidation) {
@@ -74,15 +74,61 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
 }
 	$null = New-Item -ItemType Directory -Force -Path $OutDir, (Join-Path $OutDir "raw"), (Join-Path $OutDir "archive") | Out-Null
 $LogPath = Join-Path $OutDir "actions.log"
+
+# Choose which dependents endpoint to use: 'ISPSS', 'SelfHosted', or 'Auto'
+if (-not $script:DependentsApiFlavor) { $script:DependentsApiFlavor = 'Auto' }
+
+function Get-DependentsApiFlavor {
+  param([Parameter(Mandatory)][string]$PVWAUrl)
+
+  switch ($script:DependentsApiFlavor) {
+    'ISPSS'      { return 'ISPSS' }
+    'SelfHosted' { return 'SelfHosted' }
+    default {
+      if ($PVWAUrl -match 'privilegecloud\.cyberark\.cloud$') { return 'ISPSS' }
+      return 'SelfHosted'
+    }
+  }
+}
+
+function Get-AccountDependentsUri {
+  param(
+    [Parameter(Mandatory)][string]$PVWAUrl,
+    [Parameter(Mandatory)][string]$AccountId,
+    [string]$DepId
+  )
+
+  $baseUrl = $PVWAUrl.TrimEnd('/')
+  $acctEsc = [uri]::EscapeDataString([string]$AccountId)
+  $flavor  = Get-DependentsApiFlavor -PVWAUrl $PVWAUrl
+
+  if ($flavor -eq 'ISPSS') {
+    if ($DepId) {
+      $depEsc = [uri]::EscapeDataString([string]$DepId)
+      return "$baseUrl/api/accounts/$acctEsc/account-dependents/$depEsc"
+    }
+    return "$baseUrl/api/accounts/$acctEsc/account-dependents"
+  }
+
+  # Self-Hosted PAM
+  if ($DepId) {
+    $depEsc = [uri]::EscapeDataString([string]$DepId)
+    return "$baseUrl/PasswordVault/API/Accounts/$acctEsc/dependentAccounts/$depEsc"
+  }
+  return "$baseUrl/PasswordVault/API/Accounts/$acctEsc/dependentAccounts"
+}
+
 function Write-Log { param([string]$Message,[string]$Level="INFO")
   $line = "$(Get-Date -Format s) [$Level] $Message"
   $line | Tee-Object -FilePath $LogPath -Append | Out-Null
 }
-	function As-Array([object]$o) {
+
+function As-Array([object]$o) {
   if ($null -eq $o) { return @() }
   if ($o -is [System.Collections.IEnumerable] -and $o -isnot [string]) { return @($o) }
   return ,$o
 }
+
 function Get-ArrayFromResponse {
   param([Parameter(Mandatory)][object]$Resp)
 
@@ -90,20 +136,21 @@ function Get-ArrayFromResponse {
 
   # If API returned a bare array (including empty []), return it directly
   if ($Resp -is [System.Collections.IEnumerable] -and $Resp -isnot [string]) {
-    # If it's a PSCustomObject wrapper, PSObject.Properties will exist and we should inspect it below,
-    # so only early-return when it is truly an array-like response (object[])
     if ($Resp -is [object[]]) { return @($Resp) }
   }
 
   $p = $Resp.PSObject.Properties
 
+  # Self-Hosted /dependentAccounts sometimes returns { value: [...] } or a bare array
   if ($p['value'])             { return As-Array $p['value'].Value }
-  if ($p['accountDependents']) { return As-Array $p['accountDependents'].Value }
-  if ($p['dependentAccounts']) { return As-Array $p['dependentAccounts'].Value }
-  if ($p['Dependencies'])      { return As-Array $p['Dependencies'].Value }
-  if ($p['Usages'])            { return As-Array $p['Usages'].Value }
 
-  # Fallback: sometimes the API returns a bare array (non-object[])
+  # ISPSS /account-dependents returns { accountDependents: [...], totalCount: n }
+  if ($p['accountDependents']) { return As-Array $p['accountDependents'].Value }
+
+  # Some Self-Hosted variants may wrap in 'dependentAccounts' (rare, but harmless to keep)
+  if ($p['dependentAccounts']) { return As-Array $p['dependentAccounts'].Value }
+
+  # Last resort: treat as enumerable if it isn't a string
   if ($Resp -is [System.Collections.IEnumerable] -and $Resp -isnot [string]) {
     return As-Array $Resp
   }
@@ -392,9 +439,7 @@ $AllDeps = @()
 foreach ($acct in $Accounts) {
   if (-not $acct.Id) { continue }
 
-  $baseUrl  = $PVWAUrl.TrimEnd('/')
-  $accountId = [uri]::EscapeDataString([string]$acct.Id)
-  $depUri   = "$baseUrl/api/accounts/$accountId/account-dependents"
+  $depUri = Get-AccountDependentsUri -PVWAUrl $PVWAUrl -AccountId $acct.Id
 
   try {
     $r = Invoke-PVWARest -Method GET -Uri $depUri -Headers $Headers
@@ -414,9 +459,9 @@ foreach ($acct in $Accounts) {
     Write-Log ("Dependents extracted count for {0}: {1}" -f $acct.Id, $depCount) "DEBUG"
   }
   catch {
-    Write-Log "account-dependents endpoint failed for $($acct.Id): $($_.Exception.Message)" "ERROR"
+    Write-Log "Dependents endpoint failed for $($acct.Id): $($_.Exception.Message)" "ERROR"
 
-    # still emit empty artifacts so “missing vs empty” is visible
+    # still emit empty artifacts so 'missing vs empty' is visible
     $rawWrapperPath = Join-Path $OutDir "raw\acct_$($acct.Id)_wrapper.json"
     (@{ error = $_.Exception.Message } | ConvertTo-Json -Depth 10) | Out-File -Encoding UTF8 $rawWrapperPath
 
@@ -527,93 +572,46 @@ function Update-Dependency {
     [Parameter(Mandatory)][hashtable]$NewProps
   )
   if ($NewProps.Keys.Count -eq 0) { return $true }
+
   $payload = @{}
   foreach ($k in $NewProps.Keys) { $payload[$k] = $NewProps[$k] }
 
-  $u0 = "$PVWAUrl/PasswordVault/API/Accounts/$AccountId/dependentAccounts/$DepId"
-  $u1 = "$PVWAUrl/PasswordVault/API/Accounts/$AccountId/Dependencies/$DepId"
-  $u2 = "$PVWAUrl/PasswordVault/API/Accounts/$AccountId/Usages/$DepId"
+  $u = Get-AccountDependentsUri -PVWAUrl $PVWAUrl -AccountId $AccountId -DepId $DepId
 
-  # Preferred: dependentAccounts API
   try {
-    $null = Invoke-PVWARest -Method PUT -Uri $u0 -Headers $Headers -Body $payload
-    Write-Log "Merged props into keeper via PUT dependentAccounts: acct=$AccountId dep=$DepId keys=[$(($payload.Keys -join ','))]"
+    $null = Invoke-PVWARest -Method PUT -Uri $u -Headers $Headers -Body $payload
+    Write-Log "Merged props into keeper via PUT dependents endpoint: acct=$AccountId dep=$DepId keys=[$(($payload.Keys -join ','))]"
     return $true
   } catch {
-    Write-Log "PUT /dependentAccounts failed for acct=$AccountId dep=${DepId}: $($_.Exception.Message)" "WARN"
-  }
-
-  # Legacy fallbacks: /Dependencies then /Usages
-  try {
-    $null = Invoke-PVWARest -Method PUT -Uri $u1 -Headers $Headers -Body $payload
-    Write-Log "Merged props into keeper via PUT Dependencies: acct=$AccountId dep=$DepId keys=[$(($payload.Keys -join ','))]"
-    return $true
-  } catch {
-    Write-Log "PUT /Dependencies failed for acct=$AccountId dep=${DepId}: $($_.Exception.Message)" "WARN"
-    try {
-      $null = Invoke-PVWARest -Method PATCH -Uri $u1 -Headers $Headers -Body $payload
-      Write-Log "Merged props into keeper via PATCH Dependencies: acct=$AccountId dep=$DepId"
-      return $true
-    } catch {
-      Write-Log "PATCH /Dependencies failed: $($_.Exception.Message)" "WARN"
-      try {
-        $null = Invoke-PVWARest -Method PUT -Uri $u2 -Headers $Headers -Body $payload
-        Write-Log "Merged props via PUT Usages: acct=$AccountId dep=$DepId"
-        return $true
-      } catch {
-        Write-Log "PUT /Usages failed: $($_.Exception.Message)" "WARN"
-        try {
-          $null = Invoke-PVWARest -Method PATCH -Uri $u2 -Headers $Headers -Body $payload
-          Write-Log "Merged props via PATCH Usages: acct=$AccountId dep=$DepId"
-          return $true
-        } catch {
-          Write-Log "All merge attempts failed for acct=$AccountId dep=$DepId" "ERROR"
-          return $false
-        }
-      }
-    }
+    Write-Log "PUT dependents endpoint failed for acct=$AccountId dep=${DepId}: $($_.Exception.Message)" "ERROR"
+    return $false
   }
 }
-	function Delete-Dependency {
+
+function Delete-Dependency {
   param(
     [Parameter(Mandatory)][string]$AccountId,
     [Parameter(Mandatory)][string]$DepId,
     [Parameter(Mandatory)][hashtable]$AliasRaw
   )
+
   # archive alias JSON first
   $stamp = Get-Date -Format "yyyyMMdd_HHmmssfff"
   $arch = Join-Path $OutDir ("archive\alias_acct{0}_dep{1}_{2}.json" -f $AccountId,$DepId,$stamp)
   ($AliasRaw | ConvertTo-Json -Depth 50) | Out-File -Encoding UTF8 $arch
-  $u0 = "$PVWAUrl/PasswordVault/API/Accounts/$AccountId/dependentAccounts/$DepId"
-  $u1 = "$PVWAUrl/PasswordVault/API/Accounts/$AccountId/Dependencies/$DepId"
-  $u2 = "$PVWAUrl/PasswordVault/API/Accounts/$AccountId/Usages/$DepId"
 
-  # Preferred: dependentAccounts
+  $u = Get-AccountDependentsUri -PVWAUrl $PVWAUrl -AccountId $AccountId -DepId $DepId
+
   try {
-    $null = Invoke-PVWARest -Method DELETE -Uri $u0 -Headers $Headers
-    Write-Log "Deleted alias via dependentAccounts endpoint: acct=$AccountId dep=$DepId"
+    $null = Invoke-PVWARest -Method DELETE -Uri $u -Headers $Headers
+    Write-Log "Deleted alias via DELETE dependents endpoint: acct=$AccountId dep=$DepId"
     return $true
   } catch {
-    Write-Log "DELETE /dependentAccounts failed for acct=$AccountId dep=${DepId}: $($_.Exception.Message)" "WARN"
-  }
-
-  # Legacy fallbacks
-  try {
-    $null = Invoke-PVWARest -Method DELETE -Uri $u1 -Headers $Headers
-    Write-Log "Deleted alias via Dependencies endpoint: acct=$AccountId dep=$DepId"
-    return $true
-  } catch {
-    Write-Log "DELETE /Dependencies failed for acct=$AccountId dep=${DepId}: $($_.Exception.Message)" "WARN"
-    try {
-      $null = Invoke-PVWARest -Method DELETE -Uri $u2 -Headers $Headers
-      Write-Log "Deleted alias via Usages endpoint: acct=$AccountId dep=$DepId"
-      return $true
-    } catch {
-      Write-Log "DELETE /Usages failed for acct=$AccountId dep=${DepId}: $($_.Exception.Message)" "ERROR"
-      return $false
-    }
+    Write-Log "DELETE dependents endpoint failed for acct=$AccountId dep=${DepId}: $($_.Exception.Message)" "ERROR"
+    return $false
   }
 }
+
 	# Execute plan
 $success = 0
 $merged  = 0
@@ -639,29 +637,18 @@ $deleted = 0
 $Touched = $Candidates | Select-Object -Expand AccountId -Unique
 $Post = @()
 foreach ($acctId in $Touched) {
-  $depUri0 = "$PVWAUrl/PasswordVault/API/Accounts/$acctId/dependentAccounts"
-  $depUri1 = "$PVWAUrl/PasswordVault/API/Accounts/$acctId/Dependencies"
-  $depUri2 = "$PVWAUrl/PasswordVault/API/Accounts/$acctId/Usages"
+  $depUri = Get-AccountDependentsUri -PVWAUrl $PVWAUrl -AccountId $acctId
   $deps = @()
+
   try {
-    $r = Invoke-PVWARest -Method GET -Uri $depUri0 -Headers $Headers
-    $deps = As-Array ($r.value ?? $r)
+    $r = Invoke-PVWARest -Method GET -Uri $depUri -Headers $Headers
+    $deps = @( Get-ArrayFromResponse -Resp $r )
   } catch {
-    try {
-      $r = Invoke-PVWARest -Method GET -Uri $depUri1 -Headers $Headers
-      $deps = As-Array ($r.value ?? $r.Dependencies ?? $r)
-    } catch {
-      try {
-        $r = Invoke-PVWARest -Method GET -Uri $depUri2 -Headers $Headers
-        $deps = As-Array ($r.value ?? $r.Usages ?? $r)
-      } catch {
-        Write-Log "Post-verify failed for acct=${acctId}: $($_.Exception.Message)" "ERROR"
-        continue
-      }
-    }
+    Write-Log "Post-verify failed for acct=${acctId}: $($_.Exception.Message)" "ERROR"
+    continue
   }
+
   foreach ($d in $deps) {
-    # raw snapshot as hashtable (if you want to inspect later)
     $h = @{}
     foreach ($p in $d.PSObject.Properties.Name) { $h[$p] = $d.$p }
 
@@ -671,7 +658,7 @@ foreach ($acctId in $Touched) {
 
     $Post += [pscustomobject]@{
       AccountId    = $acctId
-      DepId        = $h['Id'] ?? $h['ID'] ?? $h['DependencyID'] ?? $h['UsageID']
+      DepId        = $h['Id'] ?? $h['ID'] ?? $h['DependencyID'] ?? $h['UsageID'] ?? $h['dependentAccountId']
       Type         = "$($canon.Type)"
       Machine      = "$($canon.Machine)"
       ObjectName   = "$($canon.Object)"
@@ -681,6 +668,7 @@ foreach ($acctId in $Touched) {
     }
   }
 }
+
 	$PostPath = Join-Path $OutDir "post-state.csv"
 $Post | Export-Csv -NoTypeInformation -Encoding UTF8 $PostPath
 Write-Log "Post-state written: $PostPath"
