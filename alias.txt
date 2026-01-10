@@ -1,0 +1,6 @@
+{
+  "CORP": "corp.domain.com",
+  "corp": "corp.domain.com",
+  "corp.local": "corp.domain.com",
+  "10.0.0.1": "corp.domain.com"
+}

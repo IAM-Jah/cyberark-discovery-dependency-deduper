@@ -31,11 +31,27 @@
 	.PARAMETER AccountNameFilter
   Wildcard(s) (server/username) to client-side filter accounts. Optional.
 	.PARAMETER OutDir
-  Output folder for logs, CSVs, and JSON snapshots. Default: .\out
+  Output folder for logs, CSVs, and JSON snapshots. Default: .\out\YYYYMMDD_HHMMSS
 	.PARAMETER Apply
   When set, performs merges/deletes. Otherwise, dry-run only.
 	.PARAMETER Force
   Skip confirmation prompts when -Apply.
+	.PARAMETER PlanOnly
+  Always run in dry-run mode, even if -Apply is specified.
+	.PARAMETER ResumeFrom
+  Path to a prior dry-run CSV; replays only those rows.
+	.PARAMETER OnlyMergeKeys
+  Optional list of delta keys (supports wildcards) to merge. Example: platformDependentProperties.restartService
+	.PARAMETER Parallel
+  Fetch account dependents in parallel (PowerShell 7+ only).
+	.PARAMETER ThrottleLimit
+  Maximum number of parallel tasks when -Parallel is set.
+	.PARAMETER AccountRetry
+  Additional per-account retry attempts for dependents GET (in addition to per-call retries).
+	.PARAMETER MaxMerges
+  Maximum number of merge updates to perform in a run (0 = unlimited).
+	.PARAMETER MaxDeletes
+  Maximum number of deletes to perform in a run (0 = unlimited).
 	#>
 	[CmdletBinding(SupportsShouldProcess)]
 param(
@@ -48,9 +64,17 @@ param(
   [Parameter()][string[]]$SafeFilter,
   [Parameter()][string[]]$PlatformIdFilter,
   [Parameter()][string[]]$AccountNameFilter,
-  [Parameter()][string]$OutDir = ".\out",
+  [Parameter()][string]$OutDir,
   [Parameter()][switch]$Apply,
   [Parameter()][switch]$Force,
+  [Parameter()][switch]$PlanOnly,
+  [Parameter()][string]$ResumeFrom,
+  [Parameter()][string[]]$OnlyMergeKeys,
+  [Parameter()][switch]$Parallel,
+  [Parameter()][int]$ThrottleLimit = 4,
+  [Parameter()][int]$AccountRetry = 0,
+  [Parameter()][int]$MaxMerges = 0,
+  [Parameter()][int]$MaxDeletes = 0,
   [Parameter()][int]$PageSize = 100,
   [Parameter()][int]$TimeoutSec = 60,
   [Parameter()][switch]$VerboseRest,
@@ -72,8 +96,16 @@ public class TrustAllCertsPolicy : ICertificatePolicy {
     [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
   } catch {}
 }
+	if ([string]::IsNullOrWhiteSpace($OutDir)) {
+  $OutDir = Join-Path "." ("out\" + (Get-Date -Format "yyyyMMdd_HHmmss"))
+}
 	$null = New-Item -ItemType Directory -Force -Path $OutDir, (Join-Path $OutDir "raw"), (Join-Path $OutDir "archive") | Out-Null
 $LogPath = Join-Path $OutDir "actions.log"
+$ErrorLogPath = Join-Path $OutDir "errors.jsonl"
+	if ($PlanOnly) {
+  $Apply = $false
+  Write-Log "PlanOnly set; Apply disabled." "INFO"
+}
 
 # Choose which dependents endpoint to use: 'ISPSS', 'SelfHosted', or 'Auto'
 if (-not $script:DependentsApiFlavor) { $script:DependentsApiFlavor = 'Auto' }
@@ -123,6 +155,27 @@ function Write-Log { param([string]$Message,[string]$Level="INFO")
   $line | Tee-Object -FilePath $LogPath -Append | Out-Null
 }
 
+function Write-ErrorJson {
+  param(
+    [Parameter(Mandatory)][string]$Method,
+    [Parameter(Mandatory)][string]$Uri,
+    [int]$StatusCode,
+    [string]$Message,
+    [string]$ResponseBody,
+    [string]$RequestBody
+  )
+  $obj = [ordered]@{
+    time         = (Get-Date -Format s)
+    method       = $Method
+    uri          = $Uri
+    statusCode   = $StatusCode
+    message      = $Message
+    responseBody = $ResponseBody
+    requestBody  = $RequestBody
+  }
+  ($obj | ConvertTo-Json -Depth 20 -Compress) | Add-Content -Path $ErrorLogPath
+}
+
 function As-Array([object]$o) {
   if ($null -eq $o) { return @() }
   if ($o -is [System.Collections.IEnumerable] -and $o -isnot [string]) { return @($o) }
@@ -167,7 +220,7 @@ function Get-Prop {
 
   $psobj = [psobject]$Object
 
-  # 1st pass – direct properties on the object
+  # 1st pass - direct properties on the object
   foreach ($name in $Names) {
     $prop = $psobj.PSObject.Properties[$name]
     if ($null -ne $prop -and $null -ne $prop.Value) {
@@ -175,7 +228,7 @@ function Get-Prop {
     }
   }
 
-  # 2nd pass – platformAccountProperties (for dependentAccounts APIs)
+  # 2nd pass - platformAccountProperties (for dependentAccounts APIs)
   $platProp = $psobj.PSObject.Properties['platformAccountProperties']
   if ($platProp -and $platProp.Value) {
     $plat = $platProp.Value
@@ -196,7 +249,7 @@ function Get-Prop {
       }
     }
   }
-  # 3rd pass – platformDependentProperties (for account-dependents endpoint)
+  # 3rd pass - platformDependentProperties (for account-dependents endpoint)
   $depProp = $psobj.PSObject.Properties['platformDependentProperties']
   if ($depProp -and $depProp.Value) {
     $plat = $depProp.Value
@@ -234,6 +287,22 @@ function Get-Prop {
       return $resp
     } catch {
       $attempt++
+      $status = $null
+      $respBody = $null
+      $reqBody = $null
+      try {
+        $resp = $_.Exception.Response
+        if ($resp -and $resp.StatusCode) { $status = [int]$resp.StatusCode }
+        if ($resp -and $resp.GetResponseStream()) {
+          $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+          $respBody = $reader.ReadToEnd()
+          $reader.Close()
+        }
+      } catch {}
+      try {
+        if ($Body) { $reqBody = ($Body | ConvertTo-Json -Depth 20 -Compress) }
+      } catch {}
+      Write-ErrorJson -Method $Method -Uri $Uri -StatusCode $status -Message $_.Exception.Message -ResponseBody $respBody -RequestBody $reqBody
       if ($attempt -ge $Retry) {
         Write-Log "REST $Method failed: $Uri `n$($_.Exception.Message)" "ERROR"
         throw
@@ -346,14 +415,60 @@ function Build-JoinKey {
   return ($parts -join '|')
 }
 	# Returns a reduced-property hashtable for diff (ignores IDs/timestamps)
-$IgnoreProps = @('Id','ID','DependencyID','UsageID','AccountId','AccountID','Created','CreationTime','LastModified','LastUpdate','Address','ComputerDnsName','MachineName','Target','HostName','DisplayName','Name','PlatformId','SafeName')
+$IgnoreProps = @('Id','ID','DependencyID','UsageID','AccountId','AccountID','Created','CreationTime','LastModified','LastUpdate','Address','ComputerDnsName','MachineName','Target','HostName','DisplayName','Name','PlatformId','SafeName','LogonDomain')
+$IgnoreFlatProps = @('platformDependentProperties.logonDomain','platformAccountProperties.logonDomain')
+function Add-FlatProps {
+  param(
+    [hashtable]$Out,
+    [object]$Val,
+    [string]$Prefix
+  )
+
+  if ($null -eq $Val) { return }
+
+  # Handle hashtable or PSCustomObject
+  $pairs = @()
+
+  if ($Val -is [hashtable]) {
+    $pairs = $Val.GetEnumerator() | ForEach-Object { @{ Name = $_.Key; Value = $_.Value } }
+  } else {
+    $pairs = $Val.PSObject.Properties | ForEach-Object { @{ Name = $_.Name; Value = $_.Value } }
+  }
+
+  foreach ($p in $pairs) {
+    $k = $p.Name
+    $v = $p.Value
+    if ($null -eq $v) { continue }
+
+    $flatKey = if ($Prefix) { "$Prefix.$k" } else { "$k" }
+
+    if ($IgnoreFlatProps -contains $flatKey) { continue }
+
+    if ($v -is [string] -or $v -is [int] -or $v -is [bool] -or $v -is [double]) {
+      $Out[$flatKey] = $v
+    } elseif ($v -is [System.Collections.IEnumerable] -and $v -isnot [string]) {
+      $Out[$flatKey] = @($v)
+    }
+    # NOTE: we intentionally do NOT recurse deeper than 1 level
+  }
+}
+
 function Get-ComparableProps {
   param([hashtable]$Dep)
+
   $ht = @{}
+
   foreach ($k in $Dep.Keys) {
     if ($IgnoreProps -contains $k) { continue }
     $val = $Dep[$k]
     if ($null -eq $val) { continue }
+
+    # Flatten the two important nested containers
+    if ($k -in @('platformDependentProperties','platformAccountProperties')) {
+      Add-FlatProps -Out $ht -Val $val -Prefix $k
+      continue
+    }
+
     # Keep scalars and simple arrays only
     if ($val -is [string] -or $val -is [int] -or $val -is [bool] -or $val -is [double]) {
       $ht[$k] = $val
@@ -361,6 +476,7 @@ function Get-ComparableProps {
       $ht[$k] = @($val)
     }
   }
+
   return $ht
 }
 	function Diff-Props {
@@ -380,179 +496,367 @@ function Get-ComparableProps {
 }
 	#endregion Helpers --------------------------------------------------------------
 	$Headers = Get-AuthHeaders
-	# GET all accounts (paged). We’ll filter client-side for safety across PVWA versions.
-Write-Log "Collecting accounts..."
-$Accounts = @()
-$offset = 0
-do {
-  $u = "$PVWAUrl/PasswordVault/API/Accounts?limit=$PageSize&offset=$offset"
-  $resp = Invoke-PVWARest -Method GET -Uri $u -Headers $Headers
-  $batch = @()
-  if ($resp -and $resp.value) { $batch = As-Array $resp.value }
-  elseif ($resp -and $resp.Accounts) { $batch = As-Array $resp.Accounts }
-  elseif ($resp -is [System.Collections.IEnumerable]) { $batch = As-Array $resp }
-  else { $batch = @() }
-
-  foreach ($a in $batch) {
-    # normalize common fields (case-insensitive, StrictMode-safe)
-    $acctId       = Get-Prop $a @('id','Id','AccountID')
-    $acctName     = Get-Prop $a @('Name','name','UserName','userName')
-    $acctSafe     = Get-Prop $a @('SafeName','safeName')
-    $acctPlatform = Get-Prop $a @('PlatformId','platformId')
-    $acctAddress  = Get-Prop $a @('address','Address')
-    $acctUser     = Get-Prop $a @('UserName','userName')
-
-  $acc = [pscustomobject]@{
-    Id         = $acctId
-    Name       = $acctName ?? $acctAddress
-    SafeName   = $acctSafe
-    PlatformId = $acctPlatform
-    Address    = $acctAddress
-    UserName   = $acctUser
-  }
-  $Accounts += $acc
+	$depFlavor = Get-DependentsApiFlavor -PVWAUrl $PVWAUrl
+	$baseUrl = $PVWAUrl.TrimEnd('/')
+	if ($Parallel -and $PSVersionTable.PSVersion.Major -lt 7) {
+  Write-Log "Parallel requires PowerShell 7+; running sequential." "WARN"
+  $Parallel = $false
 }
-
-	$count = @($batch).Count
-  $offset += $PageSize
-  Write-Log "Fetched $count accounts" "DEBUG"
-} while ($count -eq $PageSize)
-	# Client-side filters
-if ($SafeFilter) {
-  $Accounts = $Accounts | Where-Object { $SafeFilter -contains $_.SafeName }
-}
-if ($PlatformIdFilter) {
-  $Accounts = $Accounts | Where-Object { $PlatformIdFilter -contains $_.PlatformId }
-}
-if ($AccountNameFilter) {
-  $Accounts = $Accounts | Where-Object {
-    $acctName = "$($_.Name) $($_.UserName) $($_.Address)"
-    foreach ($w in $AccountNameFilter) { if ($acctName -like $w) { return $true } }
-    return $false
-  }
-}
-	Write-Log "Accounts in scope: $($Accounts.Count)"
-
-# Pull dependencies/usages for each account
-$AllDeps = @()
-
-foreach ($acct in $Accounts) {
-  if (-not $acct.Id) { continue }
-
-  $depUri = Get-AccountDependentsUri -PVWAUrl $PVWAUrl -AccountId $acct.Id
-
-  try {
-    $r = Invoke-PVWARest -Method GET -Uri $depUri -Headers $Headers
-
-    # Always normalize to an array (never $null)
-    $deps = @( Get-ArrayFromResponse -Resp $r )   # forces array context
-    $depCount = $deps.Count                       # fail safe
-
-    # Write wrapper and extracted array AFTER extraction
-    $rawWrapperPath = Join-Path $OutDir "raw\acct_$($acct.Id)_wrapper.json"
-    ($r | ConvertTo-Json -Depth 50) | Out-File -Encoding UTF8 $rawWrapperPath
-
-    $rawArrayPath = Join-Path $OutDir "raw\acct_$($acct.Id)_deps.json"
-    ($deps | ConvertTo-Json -Depth 50) | Out-File -Encoding UTF8 $rawArrayPath
-
-    Write-Log ("Dependents response props for {0}: {1}" -f $acct.Id, ((@($r.PSObject.Properties.Name)) -join ',')) "DEBUG"
-    Write-Log ("Dependents extracted count for {0}: {1}" -f $acct.Id, $depCount) "DEBUG"
-  }
-  catch {
-    Write-Log "Dependents endpoint failed for $($acct.Id): $($_.Exception.Message)" "ERROR"
-
-    # still emit empty artifacts so 'missing vs empty' is visible
-    $rawWrapperPath = Join-Path $OutDir "raw\acct_$($acct.Id)_wrapper.json"
-    (@{ error = $_.Exception.Message } | ConvertTo-Json -Depth 10) | Out-File -Encoding UTF8 $rawWrapperPath
-
-    $rawArrayPath = Join-Path $OutDir "raw\acct_$($acct.Id)_deps.json"
-    "[]" | Out-File -Encoding UTF8 $rawArrayPath
-
-    continue
-  }
-
-  # Save raw snapshot (keep your existing naming if you want)
-  $rawPath = Join-Path $OutDir "raw\acct_$($acct.Id).json"
-  ($deps | ConvertTo-Json -Depth 50) | Out-File -Encoding UTF8 $rawPath
-
-  foreach ($d in $deps) {
-    $h = @{}
-    foreach ($p in $d.PSObject.Properties.Name) { $h[$p] = $d.$p }
-
-    $domain = Get-Prop $d @('LogonDomain','Domain','AccountDomain')
-    $user   = Get-Prop $d @('LogonUser','LogonUserName','User','UserName','AccountName')  # expanded a bit
-
-    $canon  = Get-CanonicalIdentifiers -Dep $d
-
-    $AllDeps += [pscustomobject]@{
-      AccountId         = $acct.Id
-      SafeName          = $acct.SafeName
-      AccountName       = $acct.Name
-      PlatformId        = $acct.PlatformId
-      DependencyId      = $h['Id'] ?? $h['ID'] ?? $h['DependencyID'] ?? $h['UsageID']
-      Raw               = $h
-      Type              = $canon.Type
-      Machine           = $canon.Machine
-      ObjectName        = $canon.Object
-      DomainOriginal    = $domain
-      DomainMapped      = Map-Domain $domain
-      UserOriginal      = $user
-      UserNormalized    = Normalize-User $user
-      JoinKey           = Build-JoinKey -Dep $d -NormalizedUser (Normalize-User $user)
+	$Candidates = @()
+	$SkipDiscovery = $false
+	if ($ResumeFrom) {
+  if (-not (Test-Path $ResumeFrom)) { throw "ResumeFrom file not found: $ResumeFrom" }
+  $resumeRows = Import-Csv $ResumeFrom
+  foreach ($r in $resumeRows) {
+    $delta = @{}
+    if ($r.DeltaPropsJson -and $r.DeltaPropsJson.Trim() -ne "") {
+      $delta = ConvertFrom-Json -InputObject $r.DeltaPropsJson -AsHashtable
     }
-  }
-}
-
-Write-Log "Dependencies/usages collected: $($AllDeps.Count)"
-
-# Identify duplicates: same Account + JoinKey but different domain strings (alias vs authoritative)
-$groups = $AllDeps | Group-Object -Property AccountId, JoinKey
-$Candidates = @()
-	foreach ($g in $groups) {
-  $items = $g.Group
-  if (@($items).Count -lt 2) { continue }
-	# Partition by whether domain is alias
-  $alias = @($items | Where-Object { $_.DomainOriginal -and $AliasSet.Contains($_.DomainOriginal) })
-  if (@($alias).Count -eq 0) { continue }
-
-  $auth  = @($items | Where-Object { $_.DomainMapped -and ($_.DomainMapped -eq $_.DomainOriginal) })
-  if (@($auth).Count -eq 0) { continue }
-
-	# Choose the first authoritative as the keeper
-  $keeper = $auth | Select-Object -First 1
-	foreach ($dup in $alias) {
-    # Compute config delta (alias minus keeper)
-    $from = Get-ComparableProps -Dep $dup.Raw
-    $to   = Get-ComparableProps -Dep $keeper.Raw
-    $delta = Diff-Props -From $from -To $to
-	$Candidates += [pscustomobject]@{
-      SafeName       = $dup.SafeName
-      AccountId      = $dup.AccountId
-      AccountName    = $dup.AccountName
-      PlatformId     = $dup.PlatformId
-      Type           = $dup.Type
-      Machine        = $dup.Machine
-      ObjectName     = $dup.ObjectName
-      JoinKey        = $dup.JoinKey
-      AliasDomain    = $dup.DomainOriginal
-      Authoritative  = $keeper.DomainOriginal
-      AliasDepId     = $dup.DependencyId
-      KeeperDepId    = $keeper.DependencyId
+    $Candidates += [pscustomobject]@{
+      SafeName       = $r.SafeName
+      AccountId      = $r.AccountId
+      AccountName    = $r.AccountName
+      PlatformId     = $r.PlatformId
+      Type           = $r.Type
+      Machine        = $r.Machine
+      ObjectName     = $r.ObjectName
+      JoinKey        = $r.JoinKey
+      AliasDomain    = $r.AliasDomain
+      Authoritative  = $r.Authoritative
+      AliasDepId     = $r.AliasDepId
+      KeeperDepId    = $r.KeeperDepId
       DeltaProps     = $delta
-      AliasRaw       = $dup.Raw
-      KeeperRaw      = $keeper.Raw
+      AliasRaw       = $null
+      KeeperRaw      = $null
     }
   }
+  $uniqueAccounts = @($Candidates | Select-Object -Expand AccountId | Sort-Object -Unique)
+  Write-Log "ResumeFrom loaded: $ResumeFrom rows=$(@($Candidates).Count) accounts=$($uniqueAccounts.Count)"
+  Write-Output "ResumeFrom path: $ResumeFrom"
+  Write-Output ("Loaded {0} rows across {1} accounts" -f (@($Candidates).Count), $uniqueAccounts.Count)
+  $SkipDiscovery = $true
 }
-	# Emit dry-run CSV
-$dry = $Candidates | Select-Object SafeName,AccountId,AccountName,PlatformId,Type,Machine,ObjectName,JoinKey,AliasDomain,Authoritative,AliasDepId,KeeperDepId,
-  @{n='DeltaPropsJson';e={ ($_."DeltaProps" | ConvertTo-Json -Depth 20 -Compress) }}
-	$DryPath = Join-Path $OutDir "dry-run.csv"
-$dry | Export-Csv -NoTypeInformation -Encoding UTF8 $DryPath
-Write-Log "Dry-run written: $DryPath"
-Write-Output "Dry-run path: $DryPath"
-$uniqueAccounts = @($Candidates | Select-Object -Expand AccountId | Sort-Object -Unique)
-Write-Output ("Found {0} alias duplicates across {1} accounts" -f (@($Candidates).Count), $uniqueAccounts.Count)
+
+if (-not $SkipDiscovery) {
+  # GET all accounts (paged). We'll filter client-side for safety across PVWA versions.
+  Write-Log "Collecting accounts..."
+  $Accounts = @()
+  $offset = 0
+  do {
+    $u = "$PVWAUrl/PasswordVault/API/Accounts?limit=$PageSize&offset=$offset"
+    $resp = Invoke-PVWARest -Method GET -Uri $u -Headers $Headers
+    $batch = @()
+    if ($resp -and $resp.value) { $batch = As-Array $resp.value }
+    elseif ($resp -and $resp.Accounts) { $batch = As-Array $resp.Accounts }
+    elseif ($resp -is [System.Collections.IEnumerable]) { $batch = As-Array $resp }
+    else { $batch = @() }
+
+    foreach ($a in $batch) {
+      # normalize common fields (case-insensitive, StrictMode-safe)
+      $acctId       = Get-Prop $a @('id','Id','AccountID')
+      $acctName     = Get-Prop $a @('Name','name','UserName','userName')
+      $acctSafe     = Get-Prop $a @('SafeName','safeName')
+      $acctPlatform = Get-Prop $a @('PlatformId','platformId')
+      $acctAddress  = Get-Prop $a @('address','Address')
+      $acctUser     = Get-Prop $a @('UserName','userName')
+
+      $acc = [pscustomobject]@{
+        Id         = $acctId
+        Name       = $acctName ?? $acctAddress
+        SafeName   = $acctSafe
+        PlatformId = $acctPlatform
+        Address    = $acctAddress
+        UserName   = $acctUser
+      }
+      $Accounts += $acc
+    }
+
+    $count = @($batch).Count
+    $offset += $PageSize
+    Write-Log "Fetched $count accounts" "DEBUG"
+  } while ($count -eq $PageSize)
+  # Client-side filters
+  if ($SafeFilter) {
+    $Accounts = $Accounts | Where-Object { $SafeFilter -contains $_.SafeName }
+  }
+  if ($PlatformIdFilter) {
+    $Accounts = $Accounts | Where-Object { $PlatformIdFilter -contains $_.PlatformId }
+  }
+  if ($AccountNameFilter) {
+    $Accounts = $Accounts | Where-Object {
+      $acctName = "$($_.Name) $($_.UserName) $($_.Address)"
+      foreach ($w in $AccountNameFilter) { if ($acctName -like $w) { return $true } }
+      return $false
+    }
+  }
+  Write-Log "Accounts in scope: $($Accounts.Count)"
+
+  # Pull dependencies/usages for each account
+  $AllDeps = @()
+
+  if ($Parallel) {
+    $depResults = $Accounts | ForEach-Object -Parallel {
+      param($acct,$baseUrl,$depFlavor,$headers,$timeoutSec,$accountRetry,$verboseRest)
+
+      function Invoke-LocalRest {
+        param(
+          [string]$Method,
+          [string]$Uri,
+          [hashtable]$Headers,
+          [object]$Body,
+          [int]$TimeoutSec,
+          [int]$Retry
+        )
+        $attempt = 0
+        do {
+          try {
+            if ($Body) {
+              return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $Headers -ContentType 'application/json' -Body ($Body | ConvertTo-Json -Depth 50) -TimeoutSec $TimeoutSec
+            } else {
+              return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $Headers -TimeoutSec $TimeoutSec
+            }
+          } catch {
+            $attempt++
+            if ($attempt -ge $Retry) { throw }
+            Start-Sleep -Seconds ([Math]::Min(2*$attempt,10))
+          }
+        } while ($true)
+      }
+
+      $acctId = $acct.Id
+      if (-not $acctId) { return [pscustomobject]@{ Account = $acct; Skip = $true } }
+      $acctEsc = [uri]::EscapeDataString([string]$acctId)
+      if ($depFlavor -eq 'ISPSS') {
+        $depUri = "$baseUrl/api/accounts/$acctEsc/account-dependents"
+      } else {
+        $depUri = "$baseUrl/PasswordVault/API/Accounts/$acctEsc/dependentAccounts"
+      }
+
+      $attempt = 0
+      do {
+        try {
+          $r = Invoke-LocalRest -Method GET -Uri $depUri -Headers $headers -TimeoutSec $timeoutSec -Retry 3
+          return [pscustomobject]@{ Account = $acct; DepUri = $depUri; Response = $r }
+        } catch {
+          $attempt++
+          if ($attempt -gt $accountRetry) {
+            $status = $null
+            $respBody = $null
+            try {
+              $resp = $_.Exception.Response
+              if ($resp -and $resp.StatusCode) { $status = [int]$resp.StatusCode }
+              if ($resp -and $resp.GetResponseStream()) {
+                $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+                $respBody = $reader.ReadToEnd()
+                $reader.Close()
+              }
+            } catch {}
+            return [pscustomobject]@{
+              Account  = $acct
+              DepUri   = $depUri
+              ErrorInfo = [pscustomobject]@{
+                Message      = $_.Exception.Message
+                StatusCode   = $status
+                ResponseBody = $respBody
+              }
+            }
+          }
+          Start-Sleep -Seconds ([Math]::Min(2*$attempt,10))
+        }
+      } while ($true)
+    } -ThrottleLimit $ThrottleLimit
+
+    foreach ($res in $depResults) {
+      if ($res.Skip) { continue }
+      $acct = $res.Account
+      if ($res.ErrorInfo) {
+        Write-Log "Dependents endpoint failed for $($acct.Id): $($res.ErrorInfo.Message)" "ERROR"
+        Write-ErrorJson -Method "GET" -Uri $res.DepUri -StatusCode $res.ErrorInfo.StatusCode -Message $res.ErrorInfo.Message -ResponseBody $res.ErrorInfo.ResponseBody -RequestBody $null
+
+        $rawWrapperPath = Join-Path $OutDir "raw\acct_$($acct.Id)_wrapper.json"
+        (@{ error = $res.ErrorInfo.Message } | ConvertTo-Json -Depth 10) | Out-File -Encoding UTF8 $rawWrapperPath
+
+        $rawArrayPath = Join-Path $OutDir "raw\acct_$($acct.Id)_deps.json"
+        "[]" | Out-File -Encoding UTF8 $rawArrayPath
+        continue
+      }
+
+      $r = $res.Response
+      $deps = @( Get-ArrayFromResponse -Resp $r )
+      $depCount = $deps.Count
+
+      $rawWrapperPath = Join-Path $OutDir "raw\acct_$($acct.Id)_wrapper.json"
+      ($r | ConvertTo-Json -Depth 50) | Out-File -Encoding UTF8 $rawWrapperPath
+
+      $rawArrayPath = Join-Path $OutDir "raw\acct_$($acct.Id)_deps.json"
+      ($deps | ConvertTo-Json -Depth 50) | Out-File -Encoding UTF8 $rawArrayPath
+
+      Write-Log ("Dependents response props for {0}: {1}" -f $acct.Id, ((@($r.PSObject.Properties.Name)) -join ',')) "DEBUG"
+      Write-Log ("Dependents extracted count for {0}: {1}" -f $acct.Id, $depCount) "DEBUG"
+
+      $rawPath = Join-Path $OutDir "raw\acct_$($acct.Id).json"
+      ($deps | ConvertTo-Json -Depth 50) | Out-File -Encoding UTF8 $rawPath
+
+      foreach ($d in $deps) {
+        $h = @{}
+        foreach ($p in $d.PSObject.Properties.Name) { $h[$p] = $d.$p }
+
+        $domain = Get-Prop $d @('LogonDomain','Domain','AccountDomain')
+        $user   = Get-Prop $d @('LogonUser','LogonUserName','User','UserName','AccountName')
+        $canon  = Get-CanonicalIdentifiers -Dep $d
+
+        $AllDeps += [pscustomobject]@{
+          AccountId         = $acct.Id
+          SafeName          = $acct.SafeName
+          AccountName       = $acct.Name
+          PlatformId        = $acct.PlatformId
+          DependencyId      = $h['Id'] ?? $h['ID'] ?? $h['DependencyID'] ?? $h['UsageID']
+          Raw               = $h
+          Type              = $canon.Type
+          Machine           = $canon.Machine
+          ObjectName        = $canon.Object
+          DomainOriginal    = $domain
+          DomainMapped      = Map-Domain $domain
+          UserOriginal      = $user
+          UserNormalized    = Normalize-User $user
+          JoinKey           = Build-JoinKey -Dep $d -NormalizedUser (Normalize-User $user)
+        }
+      }
+    }
+  } else {
+    foreach ($acct in $Accounts) {
+      if (-not $acct.Id) { continue }
+
+      $depUri = Get-AccountDependentsUri -PVWAUrl $PVWAUrl -AccountId $acct.Id
+
+      $attempt = 0
+      $lastErr = $null
+      $r = $null
+      $depOk = $false
+      do {
+        try {
+          $r = Invoke-PVWARest -Method GET -Uri $depUri -Headers $Headers
+          $depOk = $true
+          break
+        } catch {
+          $lastErr = $_
+          $attempt++
+          if ($attempt -gt $AccountRetry) { break }
+          Write-Log "Dependents endpoint retry for $($acct.Id) (attempt $attempt)" "WARN"
+          Start-Sleep -Seconds ([Math]::Min(2*$attempt,10))
+        }
+      } while ($true)
+
+      if (-not $depOk) {
+        $errMsg = if ($lastErr) { $lastErr.Exception.Message } else { "Unknown error" }
+        Write-Log "Dependents endpoint failed for $($acct.Id): $errMsg" "ERROR"
+
+        $rawWrapperPath = Join-Path $OutDir "raw\acct_$($acct.Id)_wrapper.json"
+        (@{ error = $errMsg } | ConvertTo-Json -Depth 10) | Out-File -Encoding UTF8 $rawWrapperPath
+
+        $rawArrayPath = Join-Path $OutDir "raw\acct_$($acct.Id)_deps.json"
+        "[]" | Out-File -Encoding UTF8 $rawArrayPath
+        continue
+      }
+
+      # Always normalize to an array (never $null)
+      $deps = @( Get-ArrayFromResponse -Resp $r )   # forces array context
+      $depCount = $deps.Count                       # fail safe
+
+      # Write wrapper and extracted array AFTER extraction
+      $rawWrapperPath = Join-Path $OutDir "raw\acct_$($acct.Id)_wrapper.json"
+      ($r | ConvertTo-Json -Depth 50) | Out-File -Encoding UTF8 $rawWrapperPath
+
+      $rawArrayPath = Join-Path $OutDir "raw\acct_$($acct.Id)_deps.json"
+      ($deps | ConvertTo-Json -Depth 50) | Out-File -Encoding UTF8 $rawArrayPath
+
+      Write-Log ("Dependents response props for {0}: {1}" -f $acct.Id, ((@($r.PSObject.Properties.Name)) -join ',')) "DEBUG"
+      Write-Log ("Dependents extracted count for {0}: {1}" -f $acct.Id, $depCount) "DEBUG"
+
+      # Save raw snapshot (keep your existing naming if you want)
+      $rawPath = Join-Path $OutDir "raw\acct_$($acct.Id).json"
+      ($deps | ConvertTo-Json -Depth 50) | Out-File -Encoding UTF8 $rawPath
+
+      foreach ($d in $deps) {
+        $h = @{}
+        foreach ($p in $d.PSObject.Properties.Name) { $h[$p] = $d.$p }
+
+        $domain = Get-Prop $d @('LogonDomain','Domain','AccountDomain')
+        $user   = Get-Prop $d @('LogonUser','LogonUserName','User','UserName','AccountName')  # expanded a bit
+
+        $canon  = Get-CanonicalIdentifiers -Dep $d
+
+        $AllDeps += [pscustomobject]@{
+          AccountId         = $acct.Id
+          SafeName          = $acct.SafeName
+          AccountName       = $acct.Name
+          PlatformId        = $acct.PlatformId
+          DependencyId      = $h['Id'] ?? $h['ID'] ?? $h['DependencyID'] ?? $h['UsageID']
+          Raw               = $h
+          Type              = $canon.Type
+          Machine           = $canon.Machine
+          ObjectName        = $canon.Object
+          DomainOriginal    = $domain
+          DomainMapped      = Map-Domain $domain
+          UserOriginal      = $user
+          UserNormalized    = Normalize-User $user
+          JoinKey           = Build-JoinKey -Dep $d -NormalizedUser (Normalize-User $user)
+        }
+      }
+    }
+  }
+
+  Write-Log "Dependencies/usages collected: $($AllDeps.Count)"
+
+  # Identify duplicates: same Account + JoinKey but different domain strings (alias vs authoritative)
+  $groups = $AllDeps | Group-Object -Property AccountId, JoinKey
+  $Candidates = @()
+  foreach ($g in $groups) {
+    $items = $g.Group
+    if (@($items).Count -lt 2) { continue }
+    # Partition by whether domain is alias
+    $alias = @($items | Where-Object { $_.DomainOriginal -and $AliasSet.Contains($_.DomainOriginal) })
+    if (@($alias).Count -eq 0) { continue }
+
+    $auth  = @($items | Where-Object { $_.DomainMapped -and ($_.DomainMapped -eq $_.DomainOriginal) })
+    if (@($auth).Count -eq 0) { continue }
+
+    # Choose the first authoritative as the keeper
+    $keeper = $auth | Select-Object -First 1
+    foreach ($dup in $alias) {
+      # Compute config delta (alias minus keeper)
+      $from = Get-ComparableProps -Dep $dup.Raw
+      $to   = Get-ComparableProps -Dep $keeper.Raw
+      $delta = Diff-Props -From $from -To $to
+      $Candidates += [pscustomobject]@{
+        SafeName       = $dup.SafeName
+        AccountId      = $dup.AccountId
+        AccountName    = $dup.AccountName
+        PlatformId     = $dup.PlatformId
+        Type           = $dup.Type
+        Machine        = $dup.Machine
+        ObjectName     = $dup.ObjectName
+        JoinKey        = $dup.JoinKey
+        AliasDomain    = $dup.DomainOriginal
+        Authoritative  = $keeper.DomainOriginal
+        AliasDepId     = $dup.DependencyId
+        KeeperDepId    = $keeper.DependencyId
+        DeltaProps     = $delta
+        AliasRaw       = $dup.Raw
+        KeeperRaw      = $keeper.Raw
+      }
+    }
+  }
+  # Emit dry-run CSV
+  $dry = $Candidates | Select-Object SafeName,AccountId,AccountName,PlatformId,Type,Machine,ObjectName,JoinKey,AliasDomain,Authoritative,AliasDepId,KeeperDepId,
+    @{n='DeltaPropsJson';e={ ($_."DeltaProps" | ConvertTo-Json -Depth 20 -Compress) }}
+  $DryPath = Join-Path $OutDir "dry-run.csv"
+  $dry | Export-Csv -NoTypeInformation -Encoding UTF8 $DryPath
+  Write-Log "Dry-run written: $DryPath"
+  Write-Output "Dry-run path: $DryPath"
+  $uniqueAccounts = @($Candidates | Select-Object -Expand AccountId | Sort-Object -Unique)
+  Write-Output ("Found {0} alias duplicates across {1} accounts" -f (@($Candidates).Count), $uniqueAccounts.Count)
+}
 	if (-not $Apply) {
   Write-Output "Analysis complete. Re-run with -Apply (and optionally -Force) to perform merges/deletes."
   return
@@ -578,14 +882,53 @@ function Update-Dependency {
 
   $u = Get-AccountDependentsUri -PVWAUrl $PVWAUrl -AccountId $AccountId -DepId $DepId
 
+  $flavor = Get-DependentsApiFlavor -PVWAUrl $PVWAUrl
+  if ($flavor -eq 'ISPSS') {
+    # ISPSS /account-dependents rejects PATCH and partial PUT for updates.
+    try {
+      $current = Invoke-PVWARest -Method GET -Uri $u -Headers $Headers
+      $full = Convert-DependentToPayload -Dep $current -NewProps $NewProps
+      $null = Invoke-PVWARest -Method PUT -Uri $u -Headers $Headers -Body $full
+      Write-Log "Merged props into keeper via PUT(full) dependents endpoint: acct=$AccountId dep=$DepId keys=[$(($full.Keys -join ','))]"
+      return $true
+    } catch {
+      Write-Log "PUT(full) dependents endpoint failed for acct=$AccountId dep=${DepId}: $($_.Exception.Message)" "ERROR"
+      return $false
+    }
+  }
+
+  $lastErr = $null
+  foreach ($method in @('PATCH','PUT')) {
+    try {
+      $null = Invoke-PVWARest -Method $method -Uri $u -Headers $Headers -Body $payload
+      Write-Log "Merged props into keeper via $method dependents endpoint: acct=$AccountId dep=$DepId keys=[$(($payload.Keys -join ','))]"
+      return $true
+    } catch {
+      $lastErr = $_
+      Write-Log "$method dependents endpoint failed for acct=$AccountId dep=${DepId}: $($_.Exception.Message)" "WARN"
+    }
+  }
+
+  # Fallback: PUT a full object (some ISPSS endpoints reject partial payloads)
   try {
-    $null = Invoke-PVWARest -Method PUT -Uri $u -Headers $Headers -Body $payload
-    Write-Log "Merged props into keeper via PUT dependents endpoint: acct=$AccountId dep=$DepId keys=[$(($payload.Keys -join ','))]"
-    return $true
+    $current = Invoke-PVWARest -Method GET -Uri $u -Headers $Headers
   } catch {
-    Write-Log "PUT dependents endpoint failed for acct=$AccountId dep=${DepId}: $($_.Exception.Message)" "ERROR"
+    Write-Log "GET dependents endpoint failed for acct=$AccountId dep=${DepId}: $($_.Exception.Message)" "ERROR"
     return $false
   }
+
+  $full = Convert-DependentToPayload -Dep $current -NewProps $NewProps
+  try {
+    $null = Invoke-PVWARest -Method PUT -Uri $u -Headers $Headers -Body $full
+    Write-Log "Merged props into keeper via PUT(full) dependents endpoint: acct=$AccountId dep=$DepId keys=[$(($full.Keys -join ','))]"
+    return $true
+  } catch {
+    $lastErr = $_
+    Write-Log "PUT(full) dependents endpoint failed for acct=$AccountId dep=${DepId}: $($_.Exception.Message)" "ERROR"
+  }
+
+  Write-Log "All merge attempts failed for acct=$AccountId dep=${DepId}: $($lastErr.Exception.Message)" "ERROR"
+  return $false
 }
 
 function Delete-Dependency {
@@ -595,10 +938,20 @@ function Delete-Dependency {
     [Parameter(Mandatory)][hashtable]$AliasRaw
   )
 
-  # archive alias JSON first
-  $stamp = Get-Date -Format "yyyyMMdd_HHmmssfff"
-  $arch = Join-Path $OutDir ("archive\alias_acct{0}_dep{1}_{2}.json" -f $AccountId,$DepId,$stamp)
-  ($AliasRaw | ConvertTo-Json -Depth 50) | Out-File -Encoding UTF8 $arch
+  if ($null -eq $AliasRaw -or $AliasRaw.Keys.Count -eq 0) {
+    try {
+      $AliasRaw = Get-DependentHashtable -AccountId $AccountId -DepId $DepId
+    } catch {
+      Write-Log "Fetch alias raw failed for acct=$AccountId dep=${DepId}: $($_.Exception.Message)" "WARN"
+      $AliasRaw = @{}
+    }
+  }
+  if ($AliasRaw.Keys.Count -gt 0) {
+    # archive alias JSON first
+    $stamp = Get-Date -Format "yyyyMMdd_HHmmssfff"
+    $arch = Join-Path $OutDir ("archive\alias_acct{0}_dep{1}_{2}.json" -f $AccountId,$DepId,$stamp)
+    ($AliasRaw | ConvertTo-Json -Depth 50) | Out-File -Encoding UTF8 $arch
+  }
 
   $u = Get-AccountDependentsUri -PVWAUrl $PVWAUrl -AccountId $AccountId -DepId $DepId
 
@@ -612,27 +965,226 @@ function Delete-Dependency {
   }
 }
 
+function Convert-DeltaToPayload {
+  param([hashtable]$Delta)
+
+  $payload = @{}
+  foreach ($k in $Delta.Keys) {
+    $v = $Delta[$k]
+
+    if ($k -like 'platformDependentProperties.*') {
+      if (-not $payload.ContainsKey('platformDependentProperties')) { $payload['platformDependentProperties'] = @{} }
+      $inner = $k.Substring('platformDependentProperties.'.Length)
+      $payload['platformDependentProperties'][$inner] = $v
+    }
+    elseif ($k -like 'platformAccountProperties.*') {
+      if (-not $payload.ContainsKey('platformAccountProperties')) { $payload['platformAccountProperties'] = @{} }
+      $inner = $k.Substring('platformAccountProperties.'.Length)
+      $payload['platformAccountProperties'][$inner] = $v
+    }
+    else {
+      $payload[$k] = $v
+    }
+  }
+
+  return $payload
+}
+
+function Filter-DeltaByKeys {
+  param(
+    [Parameter(Mandatory)][hashtable]$Delta,
+    [string[]]$OnlyKeys
+  )
+  if (-not $OnlyKeys -or $OnlyKeys.Count -eq 0) { return $Delta }
+
+  $filtered = @{}
+  foreach ($k in $Delta.Keys) {
+    foreach ($pat in $OnlyKeys) {
+      if ($k -like $pat) { $filtered[$k] = $Delta[$k]; break }
+    }
+  }
+  return $filtered
+}
+
+function Get-DepHashtable {
+  param([Parameter(Mandatory)][object]$Dep)
+  $h = @{}
+  foreach ($p in $Dep.PSObject.Properties.Name) { $h[$p] = $Dep.$p }
+  return $h
+}
+
+function Verify-DependencyProps {
+  param(
+    [Parameter(Mandatory)][string]$AccountId,
+    [Parameter(Mandatory)][string]$DepId,
+    [Parameter(Mandatory)][hashtable]$ExpectedDelta
+  )
+
+  if ($ExpectedDelta.Keys.Count -eq 0) { return $true }
+
+  $u = Get-AccountDependentsUri -PVWAUrl $PVWAUrl -AccountId $AccountId -DepId $DepId
+  try {
+    $dep = Invoke-PVWARest -Method GET -Uri $u -Headers $Headers
+  } catch {
+    Write-Log "Post-merge verify GET failed for acct=$AccountId dep=${DepId}: $($_.Exception.Message)" "ERROR"
+    return $false
+  }
+
+  $ht = Get-DepHashtable -Dep $dep
+  $current = Get-ComparableProps -Dep $ht
+
+  foreach ($k in $ExpectedDelta.Keys) {
+    if (-not $current.ContainsKey($k)) { return $false }
+    $a = $ExpectedDelta[$k]; $b = $current[$k]
+    if ($a -is [System.Collections.IEnumerable] -and $a -isnot [string]) {
+      if ((@($a) -join '|') -ne (@($b) -join '|')) { return $false }
+    } else {
+      if ("$a" -ne "$b") { return $false }
+    }
+  }
+  return $true
+}
+
+function Get-DependentHashtable {
+  param(
+    [Parameter(Mandatory)][string]$AccountId,
+    [Parameter(Mandatory)][string]$DepId
+  )
+  $u = Get-AccountDependentsUri -PVWAUrl $PVWAUrl -AccountId $AccountId -DepId $DepId
+  $dep = Invoke-PVWARest -Method GET -Uri $u -Headers $Headers
+  return Get-DepHashtable -Dep $dep
+}
+
+function Convert-DependentToPayload {
+  param(
+    [Parameter(Mandatory)][object]$Dep,
+    [Parameter(Mandatory)][hashtable]$NewProps
+  )
+
+  $skip = @('createdAt','modifiedAt','safeId')
+  $payload = @{}
+
+  foreach ($p in $Dep.PSObject.Properties) {
+    if ($skip -contains $p.Name) { continue }
+    $payload[$p.Name] = $p.Value
+  }
+
+  foreach ($k in $NewProps.Keys) {
+    $v = $NewProps[$k]
+    if ($k -in @('platformDependentProperties','platformAccountProperties') -and $v -is [hashtable]) {
+      if (-not $payload.ContainsKey($k) -or $null -eq $payload[$k]) { $payload[$k] = @{} }
+      $target = @{}
+      if ($payload[$k] -is [hashtable]) {
+        foreach ($tk in $payload[$k].Keys) { $target[$tk] = $payload[$k][$tk] }
+      } else {
+        foreach ($tp in $payload[$k].PSObject.Properties) { $target[$tp.Name] = $tp.Value }
+      }
+      foreach ($vk in $v.Keys) { $target[$vk] = $v[$vk] }
+      $payload[$k] = $target
+      continue
+    }
+    $payload[$k] = $v
+  }
+
+  return $payload
+}
+
 	# Execute plan
-$success = 0
+  $success = 0
 $merged  = 0
 $deleted = 0
+$AccountSummary = @{}
 	foreach ($row in $Candidates) {
   $acctId   = $row.AccountId
   $aliasDep = $row.AliasDepId
   $keepDep  = $row.KeeperDepId
+  if (-not $AccountSummary.ContainsKey($acctId)) {
+    $AccountSummary[$acctId] = [ordered]@{
+      AccountId            = $acctId
+      MergeAttempted       = 0
+      MergeOk              = 0
+      MergeFailed          = 0
+      MergeSkippedCap      = 0
+      MergeSkippedFilter   = 0
+      MergeVerifyOk        = 0
+      MergeVerifyFailed    = 0
+      DeleteOk             = 0
+      DeleteSkippedCap     = 0
+      DeleteSkippedMerge   = 0
+    }
+  }
 	# Merge keeper with alias delta
   $delta = $row.DeltaProps
   $mergedOk = $true
   if ($delta -and $delta.Keys.Count -gt 0) {
-    $mergedOk = Update-Dependency -AccountId $acctId -DepId $keepDep -NewProps $delta
-    if ($mergedOk) { $merged++ }
+    $delta = Filter-DeltaByKeys -Delta $delta -OnlyKeys $OnlyMergeKeys
+    if (-not $delta -or $delta.Keys.Count -eq 0) {
+      Write-Log "Skipping merge due to OnlyMergeKeys filter: acct=$acctId keeperDep=$keepDep" "DEBUG"
+      $AccountSummary[$acctId].MergeSkippedFilter++
+      $mergedOk = $true
+    } elseif ($MaxMerges -gt 0 -and $merged -ge $MaxMerges) {
+      Write-Log "Skipping merge due to MaxMerges cap: acct=$acctId keeperDep=$keepDep" "WARN"
+      $AccountSummary[$acctId].MergeSkippedCap++
+      $mergedOk = $false
+    } else {
+      $AccountSummary[$acctId].MergeAttempted++
+      $payload = Convert-DeltaToPayload -Delta $delta
+      $mergedOk = Update-Dependency -AccountId $acctId -DepId $keepDep -NewProps $payload
+      if ($mergedOk) {
+        $merged++
+        $AccountSummary[$acctId].MergeOk++
+        $verifyOk = Verify-DependencyProps -AccountId $acctId -DepId $keepDep -ExpectedDelta $delta
+        if ($verifyOk) {
+          $AccountSummary[$acctId].MergeVerifyOk++
+        } else {
+          $AccountSummary[$acctId].MergeVerifyFailed++
+          Write-Log "Post-merge verify failed: acct=$acctId keeperDep=$keepDep keys=[$(($delta.Keys -join ','))]" "WARN"
+        }
+      } else {
+        $AccountSummary[$acctId].MergeFailed++
+      }
+    }
+  }
+  if (-not $mergedOk) {
+    Write-Log "Skipping delete because merge failed: acct=$acctId aliasDep=$aliasDep keeperDep=$keepDep" "WARN"
+    $AccountSummary[$acctId].DeleteSkippedMerge++
+    continue
   }
 	# Delete alias duplicate
+  if ($MaxDeletes -gt 0 -and $deleted -ge $MaxDeletes) {
+    Write-Log "Skipping delete due to MaxDeletes cap: acct=$acctId aliasDep=$aliasDep" "WARN"
+    $AccountSummary[$acctId].DeleteSkippedCap++
+    continue
+  }
   $delOk = Delete-Dependency -AccountId $acctId -DepId $aliasDep -AliasRaw $row.AliasRaw
-  if ($delOk) { $deleted++ }
+  if ($delOk) {
+    $deleted++
+    $AccountSummary[$acctId].DeleteOk++
+  }
 	if ($mergedOk -and $delOk) { $success++ }
 }
 	Write-Log "Merge attempts: $merged, Deletes: $deleted, Success pairs: $success"
+	if ($AccountSummary.Count -gt 0) {
+  $summaryList = $AccountSummary.Values | ForEach-Object {
+    [pscustomobject]@{
+      AccountId        = $_.AccountId
+      MergeAttempted   = $_.MergeAttempted
+      MergeOk          = $_.MergeOk
+      MergeFailed      = $_.MergeFailed
+      MergeSkippedCap  = $_.MergeSkippedCap
+      MergeSkippedFilter = $_.MergeSkippedFilter
+      MergeVerifyOk    = $_.MergeVerifyOk
+      MergeVerifyFailed = $_.MergeVerifyFailed
+      DeleteOk         = $_.DeleteOk
+      DeleteSkippedCap = $_.DeleteSkippedCap
+      DeleteSkippedMerge = $_.DeleteSkippedMerge
+    }
+  }
+  $SummaryPath = Join-Path $OutDir "summary.csv"
+  $summaryList | Export-Csv -NoTypeInformation -Encoding UTF8 $SummaryPath
+  Write-Output "Summary: $SummaryPath"
+  $summaryList | Sort-Object AccountId | Format-Table -AutoSize | Out-String | Write-Output
+}
 	# Post-state verify for touched accounts
 $Touched = $Candidates | Select-Object -Expand AccountId -Unique
 $Post = @()
@@ -674,3 +1226,5 @@ $Post | Export-Csv -NoTypeInformation -Encoding UTF8 $PostPath
 Write-Log "Post-state written: $PostPath"
 Write-Output "Done. Merged: $merged; Deleted: $deleted; Success pairs: $success"
 Write-Output "Post-state: $PostPath"
+
+
